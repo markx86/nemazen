@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+
+from typing import Any, Callable, Self, override
+import shutil
+import subprocess
+import argparse
+import sys
+
+
+def eprint(*args, **kwargs):
+    print(*args, **kwargs, file=sys.stderr)
+
+
+def log_run(args):
+    argv = " ".join(f"'{arg}'" if " " in arg else arg for arg in args)
+    eprint(f"Running {argv}")
+
+
+class Zenity(object):
+    def __init__(self, title: str):
+        self._argv = ["zenity", "--title", title]
+
+    def _add_args(self, *args):
+        self._argv.extend(args)
+
+    def _process_stdout(self, output: str) -> Any:
+        return output
+
+    def show(self) -> Any:
+        log_run(self._argv)
+        res = subprocess.run(self._argv, stdout=subprocess.PIPE)
+        if res.returncode != 0:
+            return
+        return self._process_stdout(res.stdout.decode())
+
+    def text(self, text: str) -> Self:
+        self._add_args("--text", text)
+        return self
+
+    @classmethod
+    def list(cls, title: str):
+        return ZenityList(title)
+
+    @classmethod
+    def progress(cls, title: str):
+        return ZenityProgress(title)
+
+    @classmethod
+    def password(cls, title: str):
+        zen = Zenity(title)
+        zen._add_args("--password")
+        return zen
+
+    @classmethod
+    def notification(cls, title: str):
+        zen = Zenity(title)
+        zen._add_args("--notification")
+        return zen
+
+    @classmethod
+    def error(cls, title: str):
+        zen = Zenity(title)
+        zen._add_args("--error")
+        return zen
+
+
+class ZenityList(Zenity):
+    def __init__(self, title: str):
+        super(ZenityList, self).__init__(title)
+        self._add_args("--list")
+        self._columns = []
+        self._values_map = {}
+
+    @override
+    def _process_stdout(self, output: str) -> dict[str, str]:
+        key = output.strip()
+        _values = self._values_map[key]
+        data = {}
+        for c, v in zip(self._columns, _values):
+            data[c] = v
+        return data
+
+    def columns(self, *args) -> Self:
+        for arg in args:
+            self._columns.append(arg)
+            self._add_args("--column", arg)
+        return self
+
+    def values(self, *args) -> Self:
+        for arg in args:
+            self._values_map[arg[0]] = arg
+            self._add_args(*arg)
+        return self
+
+
+class ZenityProgress(Zenity):
+    class Proc(object):
+        def __init__(self, proc: subprocess.Popen):
+            self._proc = proc
+
+        def close(self):
+            if self._proc.poll() is None:
+                self._proc.terminate()
+                return True
+            else:
+                return False
+
+    def __init__(self, title: str):
+        super(ZenityProgress, self).__init__(title)
+        self._argv.append("--progress")
+
+    @override
+    def show(self):
+        return ZenityProgress.Proc(subprocess.Popen(self._argv))
+
+    def pulsate(self) -> Self:
+        self._add_args("--pulsate")
+        return self
+
+    def percentage(self, value: int) -> Self:
+        self._add_args(f"--percentage={value}")
+        return self
+
+
+class NmCli(object):
+    def __init__(self, *args, columns: list[str] = []):
+        columns_filter = [] if len(columns) == 0 else ["-f", ",".join(columns)]
+        self._argv = ["nmcli", "-c", "no", "-m", "multiline", *columns_filter, *args]
+
+    def _exec(
+        self, input: bytes | None = None, parse_output: Callable | None = None
+    ) -> Any:
+        log_run(self._argv)
+        res = subprocess.run(self._argv, stdout=subprocess.PIPE, input=input)
+        if res.returncode != 0:
+            return None if parse_output is not None else False
+        if parse_output is not None:
+            return parse_output(res.stdout.decode())
+        else:
+            return True
+
+    @classmethod
+    def _parse_output_with_columns(cls, output: str, columns: list[str]):
+        lines = output.splitlines()
+        # Convert lines from "KEY:        VALUE" to "VALUE"
+        lines = list(map(lambda x: x.split(":", 1)[1].strip(), lines))
+        assert len(lines) % len(columns) == 0
+        values_ = [
+            lines[i : i + len(columns)] for i in range(0, len(lines), len(columns))
+        ]
+        entries = []
+        for values in values_:
+            entry = {col: val for col, val in zip(columns, values)}
+            entries.append(entry)
+        return entries
+
+    @classmethod
+    def rescan(cls) -> bool:
+        return NmCli("device", "wifi", "rescan")._exec()
+
+    @classmethod
+    def known_networks(cls) -> None | list[dict[str, str]]:
+        columns = ["NAME"]
+
+        def parse_list(output: str) -> list[dict[str, str]]:
+            return cls._parse_output_with_columns(output, columns)
+
+        return NmCli("connection", "show", columns=columns)._exec(
+            parse_output=parse_list
+        )
+
+    @classmethod
+    def list(cls) -> None | list[dict[str, str]]:
+        columns = ["BSSID", "SSID", "SIGNAL", "BARS", "SECURITY"]
+
+        def parse_list(output: str):
+            return cls._parse_output_with_columns(output, columns)
+
+        return NmCli(
+            "device", "wifi", "list", "--rescan", "yes", columns=columns
+        )._exec(parse_output=parse_list)
+
+    @classmethod
+    def connect(cls, ssid: str, bssid: str, password: str | None = None):
+        if password is None:
+            return NmCli("device", "wifi", "connect", ssid, "bssid", bssid)._exec()
+        else:
+            return NmCli(
+                "--ask", "device", "wifi", "connect", ssid, "bssid", bssid
+            )._exec(input=password.encode())
+
+    @classmethod
+    def delete(cls, ssid: str) -> bool:
+        return NmCli("connection", "delete", ssid)._exec()
+
+
+def get_password(network_ssid: str, force: bool = False) -> str | None:
+    if force or (
+        (known_networks := NmCli.known_networks())
+        and not any(
+            network_ssid == known_network["NAME"] for known_network in known_networks
+        )
+    ):
+        password = (
+            Zenity.password("Please provide a password")
+            .text(f"Enter password for {network_ssid}")
+            .show()
+        )
+        return password if password is not None else ""
+
+
+def try_connect(network: dict[str, str], password: str | None) -> bool:
+    network_ssid = network["SSID"]
+    if NmCli.connect(network_ssid, network["BSSID"], password=password):
+        Zenity.notification(f"Connected established").text(
+            f"Successfully connected to {network_ssid}"
+        ).show()
+        return True
+    else:
+        return False
+
+
+def show_connection_error(network_ssid: str):
+    Zenity.error(f"Connection error").text(
+        f"Could not connect to {network_ssid}."
+    ).show()
+
+
+def connect():
+    bar = (
+        Zenity.progress("Scanning networks...")
+        .text("NetworkManager is scanning for networks. Please wait.")
+        .percentage(0)
+        .pulsate()
+        .show()
+    )
+
+    networks = NmCli.list()
+
+    if not bar.close():
+        # User cancelled the action, quit
+        return
+    if not networks:
+        Zenity.error("Scan error").text(
+            "Could not scan for networks. Please check the logs for more information."
+        )
+        return
+
+    columns = list(networks[0].keys())
+    values = [list(network.values()) for network in networks]
+
+    if not (
+        network := Zenity.list("Choose a network")
+        .columns(*columns)
+        .values(*values)
+        .show()
+    ):
+        return
+
+    network_ssid = network["SSID"]
+    password = None if network["SECURITY"] == "--" else get_password(network_ssid)
+    if password is not None and len(password) == 0:
+        # User canceled the action, quit
+        show_connection_error(network_ssid)
+        return
+
+    if not try_connect(network, password):
+        while True:
+            if (
+                Zenity.error("Connection error")
+                .text(
+                    "\n".join(
+                        [
+                            f"Could not connect to {network_ssid}.",
+                            "Please enter the password again.",
+                            "NOTE THAT BY PROCEEDING THE NETWORK WILL BE RECREATED AND ANY CHANGES YOU MADE WILL BE LOST.",
+                            "IF YOU DON'T WANT THAT, PRESS 'CANCEL' ON THE NEXT SCREEN OR CLOSE THIS WINDOW.",
+                        ]
+                    )
+                )
+                .show()
+                is None
+            ):
+                break
+            if (new_password := get_password(network_ssid, force=True)) and len(
+                new_password
+            ) > 0:
+                # Attempt to recreate a network.
+                # FIXME: Figure out why it won't work without this. I hate nmcli.
+                NmCli.delete(network_ssid)
+                if not try_connect(network, new_password):
+                    continue
+            else:
+                break
+
+
+def check_requirements():
+    success = True
+    if not shutil.which("zenity"):
+        eprint("Could not find zenity", flush=True)
+        success = False
+    if not shutil.which("nmcli"):
+        eprint("Could not find nmcli", flush=True)
+        success = False
+    return success
+
+
+MODES = {"connect": connect}
+
+
+def main():
+    if not check_requirements():
+        exit(-1)
+
+    parser = argparse.ArgumentParser(
+        prog="nemazen",
+        description="Simple GUI around nmcli",
+        epilog="Created by markx86",
+    )
+    parser.add_argument("mode", choices=["connect"])
+
+    args = parser.parse_args()
+
+    assert (func := MODES.get(args.mode))
+    func()
+
+
+if __name__ == "__main__":
+    main()

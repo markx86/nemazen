@@ -245,6 +245,9 @@ def connect():
             "Could not scan for networks. Please check the logs for more information."
         ).show()
         return
+    if len(networks) == 0:
+        Zenity.error("No networks").text("No networks found!").show()
+        return
 
     columns = list(networks[0].keys())
     values = [list(network.values()) for network in networks]
